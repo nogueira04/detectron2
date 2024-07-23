@@ -1,167 +1,188 @@
-#!/usr/bin/env python
-# Copyright (c) Facebook, Inc. and its affiliates.
-"""
-A main training script.
-
-This scripts reads a given config file and runs the training or evaluation.
-It is an entry point that is made to train standard models in detectron2.
-
-In order to let one script support training of many models,
-this script contains logic that are specific to these built-in models and therefore
-may not be suitable for your own project.
-For example, your research project perhaps only needs a single "evaluator".
-
-Therefore, we recommend you to use detectron2 as an library and take
-this file as an example of how to use the library.
-You may want to write your own script with your datasets and other customizations.
-"""
-
-import logging
-import os
-from collections import OrderedDict
-
-import detectron2.utils.comm as comm
-from detectron2.checkpoint import DetectionCheckpointer
+import detectron2
+from detectron2.engine import DefaultTrainer
 from detectron2.config import get_cfg
-from detectron2.data import MetadataCatalog
-from detectron2.engine import DefaultTrainer, default_argument_parser, default_setup, hooks, launch
-from detectron2.evaluation import (
-    CityscapesInstanceEvaluator,
-    CityscapesSemSegEvaluator,
-    COCOEvaluator,
-    COCOPanopticEvaluator,
-    DatasetEvaluators,
-    LVISEvaluator,
-    PascalVOCDetectionEvaluator,
-    SemSegEvaluator,
-    verify_results,
-)
-from detectron2.modeling import GeneralizedRCNNWithTTA
+from detectron2.data import build_detection_train_loader, DatasetCatalog, MetadataCatalog
+from detectron2.data import DatasetMapper
+from detectron2.data.datasets import load_coco_json
+from detectron2.evaluation import COCOEvaluator, inference_on_dataset
+from detectron2.data import build_detection_test_loader
+from detectron2.utils.events import get_event_storage
+import os
+import sys
+import pickle
+import argparse
+import torch
+import time
+import io
+import numpy as np
 
 
-def build_evaluator(cfg, dataset_name, output_folder=None):
-    """
-    Create evaluator(s) for a given dataset.
-    This uses the special metadata "evaluator_type" associated with each builtin dataset.
-    For your own dataset, you can simply create an evaluator manually in your
-    script and do not have to worry about the hacky if-else logic here.
-    """
-    if output_folder is None:
+_DATASETS = {
+    'nucoco_mini_val': {
+        'img_dir': '/home/live/RRPNv2/RRPN/data/nucoco/val',
+        'ann_file': '/home/live/RRPNv2/RRPN/data/nucoco/annotations/instances_val.json',
+    },
+    'nucoco_mini_train': {
+        'img_dir': '/home/live/RRPNv2/RRPN/data/nucoco/train',
+        'ann_file': '/home/live/RRPNv2/RRPN/data/nucoco/annotations/instances_train.json',
+    },
+}
+
+category_id_to_name = {0: "person", 1: "bicycle", 2: "car", 3: "motorcycle", 4: "bus", 5: "truck"}
+
+def register_datasets():
+    for dataset_name, dataset_info in _DATASETS.items():
+        DatasetCatalog.register(dataset_name, lambda dataset_info=dataset_info: load_coco_json(dataset_info['ann_file'], dataset_info['img_dir']))
+        MetadataCatalog.get(dataset_name).set(thing_classes=list(category_id_to_name.values()))
+
+# Register the datasets
+register_datasets()
+
+def add_proposal_cfg(cfg):
+    cfg.DATASETS.PROPOSAL_FILES_TRAIN = "/home/live/RRPNv2/RRPN/data/nucoco/proposals/proposals_mini_train.pkl"
+    cfg.DATASETS.PROPOSAL_FILES_TEST = "/home/live/RRPNv2/RRPN/data/nucoco/proposals/proposals_mini_val.pkl"
+
+class RadarDatasetMapper(DatasetMapper):
+    def __init__(self, cfg, is_train=True, proposal_files=None):
+        super().__init__(cfg, is_train)
+        self.proposal_files = proposal_files
+        with open(self.proposal_files, 'rb') as f:
+            self.proposals = pickle.load(f)
+        
+        self.proposal_ids = set(self.proposals['ids'])
+        self.id_to_index = {img_id: idx for idx, img_id in enumerate(self.proposals['ids'])}
+
+    def __call__(self, dataset_dict):
+        dataset_dict = super().__call__(dataset_dict)
+        image_id = dataset_dict["image_id"]
+        if image_id in self.proposal_ids:
+            idx = self.id_to_index[image_id]
+            proposals = self.proposals['boxes'][idx]
+            if np.isnan(proposals).any() or np.isinf(proposals).any():
+                print(f"Proposals for image_id {image_id} contain NaN or Inf values")
+                print(f"Proposals: {proposals}")
+                raise ValueError(f"Proposals contain NaN or Inf for image_id {image_id}")
+            dataset_dict["proposals"] = {
+                "boxes": proposals,
+                "scores": self.proposals['scores'][idx]
+            }
+        else:
+            print(f"No proposals found for image_id {image_id}")
+            raise ValueError(f"No proposals found for image_id {image_id}")
+
+        return dataset_dict
+
+# Verify Datasets
+def verify_datasets():
+    for dataset_name in _DATASETS.keys():
+        dataset_dicts = DatasetCatalog.get(dataset_name)
+        metadata = MetadataCatalog.get(dataset_name)
+        print(f"Dataset: {dataset_name}, Number of samples: {len(dataset_dicts)}")
+        print(f"Metadata: {metadata}")
+
+        # Inspect some annotations
+        for i, d in enumerate(dataset_dicts[:3]):
+            print(f"Sample {i}: {d}")
+
+train_proposals_path = "/home/live/RRPNv2/RRPN/data/nucoco/proposals/proposals_mini_train.pkl"
+val_proposals_path = "/home/live/RRPNv2/RRPN/data/nucoco/proposals/proposals_mini_val.pkl"
+
+def verify_proposals(proposals_path):
+    with open(proposals_path, 'rb') as f:
+        proposals = pickle.load(f)
+        print(f"Proposals Keys: {proposals.keys()}")
+        print(f"Number of Proposals: {len(proposals['ids'])}")
+        print(f"Example Proposal: {proposals['boxes'][0]}")
+
+# Validate Data Loader
+def data_loader_test(cfg):
+    print("Testing Train Data Loader")
+    train_loader = build_detection_train_loader(cfg)
+    for batch in train_loader:
+        print(f"Train Data Batch: {batch}")
+        break
+
+    print("Testing Test Data Loader")
+    test_loader = build_detection_test_loader(cfg, cfg.DATASETS.TEST[0])
+    for batch in test_loader:
+        print(f"Test Data Batch: {batch}")
+        break
+
+class CustomTrainer(DefaultTrainer):
+    @classmethod
+    def build_train_loader(cls, cfg):
+        proposal_files_train = cfg.DATASETS.PROPOSAL_FILES_TRAIN
+        mapper = RadarDatasetMapper(cfg, is_train=True, proposal_files=proposal_files_train)
+        return build_detection_train_loader(cfg, mapper=mapper)
+
+    @classmethod
+    def build_evaluator(cls, cfg, dataset_name):
         output_folder = os.path.join(cfg.OUTPUT_DIR, "inference")
-    evaluator_list = []
-    evaluator_type = MetadataCatalog.get(dataset_name).evaluator_type
-    if evaluator_type in ["sem_seg", "coco_panoptic_seg"]:
-        evaluator_list.append(
-            SemSegEvaluator(
-                dataset_name,
-                distributed=True,
-                output_dir=output_folder,
-            )
-        )
-    if evaluator_type in ["coco", "coco_panoptic_seg"]:
-        evaluator_list.append(COCOEvaluator(dataset_name, output_dir=output_folder))
-    if evaluator_type == "coco_panoptic_seg":
-        evaluator_list.append(COCOPanopticEvaluator(dataset_name, output_folder))
-    if evaluator_type == "cityscapes_instance":
-        return CityscapesInstanceEvaluator(dataset_name)
-    if evaluator_type == "cityscapes_sem_seg":
-        return CityscapesSemSegEvaluator(dataset_name)
-    elif evaluator_type == "pascal_voc":
-        return PascalVOCDetectionEvaluator(dataset_name)
-    elif evaluator_type == "lvis":
-        return LVISEvaluator(dataset_name, output_dir=output_folder)
-    if len(evaluator_list) == 0:
-        raise NotImplementedError(
-            "no Evaluator for the dataset {} with the type {}".format(dataset_name, evaluator_type)
-        )
-    elif len(evaluator_list) == 1:
-        return evaluator_list[0]
-    return DatasetEvaluators(evaluator_list)
+        return COCOEvaluator(dataset_name, cfg, True, output_folder)
 
+    def run_step(self):
+        assert self.model.training, "[CustomTrainer] model was changed to eval mode!"
+        start = time.perf_counter()
+        if not hasattr(self, "_data_loader_iter"):
+            self._data_loader_iter = iter(self.data_loader)
+        data = next(self._data_loader_iter)
+        data_time = time.perf_counter() - start
 
-class Trainer(DefaultTrainer):
-    """
-    We use the "DefaultTrainer" which contains pre-defined default logic for
-    standard training workflow. They may not work for you, especially if you
-    are working on a new research project. In that case you can write your
-    own training loop. You can use "tools/plain_train_net.py" as an example.
-    """
+        # print(f"Data Batch: {data}")
 
-    @classmethod
-    def build_evaluator(cls, cfg, dataset_name, output_folder=None):
-        return build_evaluator(cfg, dataset_name, output_folder)
+        loss_dict = self.model(data)
+        losses = sum(loss_dict.values())
 
-    @classmethod
-    def test_with_TTA(cls, cfg, model):
-        logger = logging.getLogger("detectron2.trainer")
-        # In the end of training, run an evaluation with TTA
-        # Only support some R-CNN models.
-        logger.info("Running inference with test-time augmentation ...")
-        model = GeneralizedRCNNWithTTA(cfg, model)
-        evaluators = [
-            cls.build_evaluator(
-                cfg, name, output_folder=os.path.join(cfg.OUTPUT_DIR, "inference_TTA")
-            )
-            for name in cfg.DATASETS.TEST
-        ]
-        res = cls.test(cfg, model, evaluators)
-        res = OrderedDict({k + "_TTA": v for k, v in res.items()})
-        return res
+        if torch.isnan(losses).any() or torch.isinf(losses).any():
+            print(f"NaN or Inf detected in losses: {loss_dict}")
+            raise ValueError("NaN or Inf detected in loss computation")
 
+        self.optimizer.zero_grad()
+        losses.backward()
+        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+        self.optimizer.step()
+
+        self._write_metrics(loss_dict, data_time)
+
+    def _write_metrics(self, loss_dict, data_time):
+        metrics_dict = {k: v.item() if isinstance(v, torch.Tensor) else float(v) for k, v in loss_dict.items()}
+        metrics_dict["data_time"] = data_time
+        storage = get_event_storage()
+        storage.put_scalars(**metrics_dict, smoothing_hint=False)
 
 def setup(args):
-    """
-    Create configs and perform basic setups.
-    """
     cfg = get_cfg()
+    add_proposal_cfg(cfg)
+    cfg.set_new_allowed(True)
     cfg.merge_from_file(args.config_file)
     cfg.merge_from_list(args.opts)
     cfg.freeze()
-    default_setup(cfg, args)
     return cfg
-
 
 def main(args):
     cfg = setup(args)
-
-    if args.eval_only:
-        model = Trainer.build_model(cfg)
-        DetectionCheckpointer(model, save_dir=cfg.OUTPUT_DIR).resume_or_load(
-            cfg.MODEL.WEIGHTS, resume=args.resume
-        )
-        res = Trainer.test(cfg, model)
-        if cfg.TEST.AUG.ENABLED:
-            res.update(Trainer.test_with_TTA(cfg, model))
-        if comm.is_main_process():
-            verify_results(cfg, res)
-        return res
-
-    """
-    If you'd like to do anything fancier than the standard training logic,
-    consider writing your own training loop (see plain_train_net.py) or
-    subclassing the trainer.
-    """
-    trainer = Trainer(cfg)
-    trainer.resume_or_load(resume=args.resume)
-    if cfg.TEST.AUG.ENABLED:
-        trainer.register_hooks(
-            [hooks.EvalHook(0, lambda: trainer.test_with_TTA(cfg, trainer.model))]
-        )
-    return trainer.train()
-
-
-def invoke_main() -> None:
-    args = default_argument_parser().parse_args()
-    print("Command Line Args:", args)
-    launch(
-        main,
-        args.num_gpus,
-        num_machines=args.num_machines,
-        machine_rank=args.machine_rank,
-        dist_url=args.dist_url,
-        args=(args,),
-    )
-
+    
+    # Verify datasets and proposals
+    print("Verifying Datasets...")
+    verify_datasets()
+    print("Verifying Proposals...")
+    verify_proposals(train_proposals_path)
+    verify_proposals(val_proposals_path)
+    
+    # Test Data Loader
+    print("Testing Data Loaders...")
+    data_loader_test(cfg)
+    
+    # Train with Detailed Logging
+    trainer = CustomTrainer(cfg)
+    trainer.resume_or_load(resume=False)
+    trainer.train()
 
 if __name__ == "__main__":
-    invoke_main()  # pragma: no cover
+    parser = argparse.ArgumentParser(description="Train a Detectron2 model")
+    parser.add_argument("--config-file", default="", metavar="FILE", help="path to config file")
+    parser.add_argument("--num-gpus", type=int, default=1, help="number of gpus *per machine*")
+    parser.add_argument("opts", help="Modify config options using the command-line", default=None, nargs=argparse.REMAINDER)
+    args = parser.parse_args()
+    print("Command Line Args:", args)
+    main(args)

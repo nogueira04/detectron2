@@ -175,7 +175,7 @@ def print_instances_class_histogram(dataset_dicts, class_names):
         annos = entry["annotations"]
         classes = np.asarray(
             [x["category_id"] for x in annos if not x.get("iscrowd", 0)], dtype=int
-        )
+        ) - 1
         if len(classes):
             assert classes.min() >= 0, f"Got an invalid category_id={classes.min()}"
             assert (
