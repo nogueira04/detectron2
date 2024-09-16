@@ -7,40 +7,58 @@ from detectron2.data.datasets import load_coco_json
 from detectron2.evaluation import COCOEvaluator, inference_on_dataset
 from detectron2.data import build_detection_test_loader
 from detectron2.utils.events import get_event_storage
+from detectron2.utils.visualizer import Visualizer
+import matplotlib.pyplot as plt
 import os
 import sys
 import pickle
 import argparse
 import torch
+import torch.multiprocessing
 import time
 import io
 import numpy as np
+import resource
+import json
+import cv2
 
+torch.multiprocessing.set_sharing_strategy('file_system')
+
+# Monitor File Descriptors
+def check_open_fds():
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    print(f"Soft limit: {soft}, Hard limit: {hard}")
+    print(f"Number of open file descriptors: {len(os.listdir('/proc/self/fd'))}")
+
+check_open_fds()
 
 _DATASETS = {
-    'nucoco_mini_val': {
-        'img_dir': '/home/live/RRPNv2/RRPN/data/nucoco/val',
-        'ann_file': '/home/live/RRPNv2/RRPN/data/nucoco/annotations/instances_val.json',
+    'nucoco_val': {
+        'img_dir': '/clusterlivenfs/gnmp/RRPN/data/nucoco/val',
+        'ann_file': '/clusterlivenfs/gnmp/RRPN/data/nucoco/annotations/instances_val.json',
     },
-    'nucoco_mini_train': {
-        'img_dir': '/home/live/RRPNv2/RRPN/data/nucoco/train',
-        'ann_file': '/home/live/RRPNv2/RRPN/data/nucoco/annotations/instances_train.json',
+    'nucoco_train': {
+        'img_dir': '/clusterlivenfs/gnmp/RRPN/data/nucoco/train',
+        'ann_file': '/clusterlivenfs/gnmp/RRPN/data/nucoco/annotations/instances_train.json',
     },
 }
 
-category_id_to_name = {0: "person", 1: "bicycle", 2: "car", 3: "motorcycle", 4: "bus", 5: "truck"}
+category_id_to_name = {0: "_", 1: "person", 2: "bicycle", 3: "car", 4: "motorcycle", 5: "bus", 6: "truck"}
 
 def register_datasets():
     for dataset_name, dataset_info in _DATASETS.items():
+        # Register the dataset
         DatasetCatalog.register(dataset_name, lambda dataset_info=dataset_info: load_coco_json(dataset_info['ann_file'], dataset_info['img_dir']))
+        # Set the metadata for the dataset (e.g., class names)
         MetadataCatalog.get(dataset_name).set(thing_classes=list(category_id_to_name.values()))
 
-# Register the datasets
+DatasetCatalog.clear()  # Clear any existing dataset registration
+MetadataCatalog.clear()  # Clear existing metadata
 register_datasets()
 
 def add_proposal_cfg(cfg):
-    cfg.DATASETS.PROPOSAL_FILES_TRAIN = "/home/live/RRPNv2/RRPN/data/nucoco/proposals/proposals_mini_train.pkl"
-    cfg.DATASETS.PROPOSAL_FILES_TEST = "/home/live/RRPNv2/RRPN/data/nucoco/proposals/proposals_mini_val.pkl"
+    cfg.DATASETS.PROPOSAL_FILES_TRAIN = "/clusterlivenfs/gnmp/RRPN/data/nucoco/proposals/proposals_train.pkl"
+    cfg.DATASETS.PROPOSAL_FILES_TEST = "/clusterlivenfs/gnmp/RRPN/data/nucoco/proposals/proposals_val.pkl"
 
 class RadarDatasetMapper(DatasetMapper):
     def __init__(self, cfg, is_train=True, proposal_files=None):
@@ -84,15 +102,17 @@ def verify_datasets():
         for i, d in enumerate(dataset_dicts[:3]):
             print(f"Sample {i}: {d}")
 
-train_proposals_path = "/home/live/RRPNv2/RRPN/data/nucoco/proposals/proposals_mini_train.pkl"
-val_proposals_path = "/home/live/RRPNv2/RRPN/data/nucoco/proposals/proposals_mini_val.pkl"
+train_proposals_path = "/clusterlivenfs/gnmp/RRPN/data/nucoco/proposals/proposals_train.pkl"
+val_proposals_path = "/clusterlivenfs/gnmp/RRPN/data/nucoco/proposals/proposals_val.pkl"
 
 def verify_proposals(proposals_path):
+    check_open_fds()
     with open(proposals_path, 'rb') as f:
         proposals = pickle.load(f)
         print(f"Proposals Keys: {proposals.keys()}")
         print(f"Number of Proposals: {len(proposals['ids'])}")
         print(f"Example Proposal: {proposals['boxes'][0]}")
+    check_open_fds()
 
 # Validate Data Loader
 def data_loader_test(cfg):
@@ -108,12 +128,23 @@ def data_loader_test(cfg):
         print(f"Test Data Batch: {batch}")
         break
 
+
 class CustomTrainer(DefaultTrainer):
+    def __init__(self, cfg, debug=False, debug_interval=50):
+        super().__init__(cfg)
+        self.debug = True
+        self.debug_dir = os.path.join(cfg.OUTPUT_DIR, "debug_data")
+        self.debug_interval = debug_interval  # Interval for saving debug information
+        self.iteration_count = 0  # Track iterations
+        if self.debug:
+            os.makedirs(self.debug_dir, exist_ok=True)
+            self.metadata = MetadataCatalog.get(cfg.DATASETS.TRAIN[0])
+
     @classmethod
     def build_train_loader(cls, cfg):
         proposal_files_train = cfg.DATASETS.PROPOSAL_FILES_TRAIN
         mapper = RadarDatasetMapper(cfg, is_train=True, proposal_files=proposal_files_train)
-        return build_detection_train_loader(cfg, mapper=mapper)
+        return build_detection_train_loader(cfg, mapper=mapper, num_workers=1)
 
     @classmethod
     def build_evaluator(cls, cfg, dataset_name):
@@ -128,7 +159,9 @@ class CustomTrainer(DefaultTrainer):
         data = next(self._data_loader_iter)
         data_time = time.perf_counter() - start
 
-        # print(f"Data Batch: {data}")
+        # Save debug information at specific intervals
+        if self.debug and (self.iteration_count % self.debug_interval == 0):
+            self._save_debug_info(data)
 
         loss_dict = self.model(data)
         losses = sum(loss_dict.values())
@@ -144,13 +177,62 @@ class CustomTrainer(DefaultTrainer):
 
         self._write_metrics(loss_dict, data_time)
 
+        # Increment the iteration counter
+        self.iteration_count += 1
+
     def _write_metrics(self, loss_dict, data_time):
         metrics_dict = {k: v.item() if isinstance(v, torch.Tensor) else float(v) for k, v in loss_dict.items()}
         metrics_dict["data_time"] = data_time
         storage = get_event_storage()
         storage.put_scalars(**metrics_dict, smoothing_hint=False)
 
-def setup(args):
+    def _save_debug_info(self, data, limit_per_batch=2):
+        saved_count = 0  
+
+        for i, batch in enumerate(data):
+            if saved_count >= limit_per_batch:
+                break  
+
+            image_id = batch["image_id"]
+            image = batch["image"].permute(1, 2, 0).cpu().numpy()  
+            image = (image - image.min()) / (image.max() - image.min())  
+            image = (image * 255).astype(np.uint8)  
+            
+            image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+            
+            image_folder = os.path.join(self.debug_dir, f"image_{image_id}_{i}")
+            os.makedirs(image_folder, exist_ok=True)
+
+            original_image_file = os.path.join(image_folder, "original_image.png")
+            cv2.imwrite(original_image_file, image)
+
+            gt_boxes = batch["instances"].gt_boxes.tensor.cpu().numpy()
+            gt_classes = batch["instances"].gt_classes.cpu().numpy()
+
+            for box, cls in zip(gt_boxes, gt_classes):
+                x0, y0, x1, y1 = box.astype(int)
+                class_name = self.metadata.thing_classes[cls]
+                color = (0, 255, 0) 
+                cv2.rectangle(image, (x0, y0), (x1, y1), color, 2)
+                cv2.putText(image, class_name, (x0, y0 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.9, color, 2)
+
+            gt_image_file = os.path.join(image_folder, "gt_image.png")
+            cv2.imwrite(gt_image_file, image)
+
+            gt_data = {
+                "image_id": image_id,
+                "gt_boxes": gt_boxes.tolist(),
+                "gt_classes": gt_classes.tolist(),
+                "gt_class_names": [self.metadata.thing_classes[cls] for cls in gt_classes],
+            }
+            gt_file = os.path.join(image_folder, "debug_data.json")
+            with open(gt_file, 'w') as f:
+                json.dump(gt_data, f, indent=4)
+
+            saved_count += 1
+
+
+def setup(args):    
     cfg = get_cfg()
     add_proposal_cfg(cfg)
     cfg.set_new_allowed(True)
@@ -162,19 +244,11 @@ def setup(args):
 def main(args):
     cfg = setup(args)
     
-    # Verify datasets and proposals
-    print("Verifying Datasets...")
-    verify_datasets()
-    print("Verifying Proposals...")
-    verify_proposals(train_proposals_path)
-    verify_proposals(val_proposals_path)
-    
-    # Test Data Loader
-    print("Testing Data Loaders...")
-    data_loader_test(cfg)
-    
+    # Add debug argument
+    debug = 'DEBUG' in args.opts
+
     # Train with Detailed Logging
-    trainer = CustomTrainer(cfg)
+    trainer = CustomTrainer(cfg, debug=debug)
     trainer.resume_or_load(resume=False)
     trainer.train()
 
