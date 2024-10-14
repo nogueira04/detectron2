@@ -361,6 +361,8 @@ class COCOEvaluator(DatasetEvaluator):
         # from https://github.com/facebookresearch/Detectron/blob/a6a835f5b8208c45d0dce217ce9bbda915f44df7/detectron/datasets/json_dataset_evaluator.py#L222-L252 # noqa
         precisions = coco_eval.eval["precision"]
         # precision has dims (iou, recall, cls, area range, max dets)
+        print("len class_names", len(class_names))
+        print("precisions.shape", precisions.shape)
         assert len(class_names) == precisions.shape[2]
 
         results_per_category = []

@@ -8,7 +8,9 @@ from detectron2.evaluation import COCOEvaluator, inference_on_dataset
 from detectron2.data import build_detection_test_loader
 from detectron2.utils.events import get_event_storage
 from detectron2.utils.visualizer import Visualizer
+from detectron2.structures import Boxes, Instances
 import matplotlib.pyplot as plt
+import torch.multiprocessing as mp
 import os
 import sys
 import pickle
@@ -57,14 +59,15 @@ MetadataCatalog.clear()  # Clear existing metadata
 register_datasets()
 
 def add_proposal_cfg(cfg):
-    cfg.DATASETS.PROPOSAL_FILES_TRAIN = "/clusterlivenfs/gnmp/RRPN/data/nucoco/proposals/proposals_train.pkl"
-    cfg.DATASETS.PROPOSAL_FILES_TEST = "/clusterlivenfs/gnmp/RRPN/data/nucoco/proposals/proposals_val.pkl"
+    cfg.DATASETS.PROPOSAL_FILES_TRAIN = ("/clusterlivenfs/gnmp/RRPN/data/nucoco/proposals/proposals_train.pkl", )
+    cfg.DATASETS.PROPOSAL_FILES_TEST = ("/clusterlivenfs/gnmp/RRPN/data/nucoco/proposals/proposals_val.pkl", )
 
 class RadarDatasetMapper(DatasetMapper):
-    def __init__(self, cfg, is_train=True, proposal_files=None):
+    def __init__(self, cfg, is_train=True, proposal_files=None, device=None):
         super().__init__(cfg, is_train)
         self.proposal_files = proposal_files
-        with open(self.proposal_files, 'rb') as f:
+        self.device = device  # Store the device
+        with open(self.proposal_files[0], 'rb') as f:
             self.proposals = pickle.load(f)
         
         self.proposal_ids = set(self.proposals['ids'])
@@ -75,20 +78,29 @@ class RadarDatasetMapper(DatasetMapper):
         image_id = dataset_dict["image_id"]
         if image_id in self.proposal_ids:
             idx = self.id_to_index[image_id]
-            proposals = self.proposals['boxes'][idx]
+            proposals = self.proposals['boxes'][idx]  # This should be a numpy array of shape [N, 4]
+            scores = self.proposals['scores'][idx]     # This should be a corresponding numpy array of shape [N]
+
+            # Check for NaN or Inf
             if np.isnan(proposals).any() or np.isinf(proposals).any():
                 print(f"Proposals for image_id {image_id} contain NaN or Inf values")
                 print(f"Proposals: {proposals}")
                 raise ValueError(f"Proposals contain NaN or Inf for image_id {image_id}")
+
+            # Convert proposals to a format Detectron2 expects
             dataset_dict["proposals"] = {
-                "boxes": proposals,
-                "scores": self.proposals['scores'][idx]
+                "boxes": torch.tensor(proposals, dtype=torch.float32).to(self.device),
+                "objectness_logits": torch.tensor(scores, dtype=torch.float32).to(self.device)
             }
+            dataset_dict['proposals'] = Instances(dataset_dict['image'].shape[1:], proposal_boxes=Boxes(dataset_dict['proposals']['boxes']), objectness_logits=dataset_dict['proposals']['objectness_logits'])
+
         else:
             print(f"No proposals found for image_id {image_id}")
             raise ValueError(f"No proposals found for image_id {image_id}")
 
         return dataset_dict
+
+
 
 # Verify Datasets
 def verify_datasets():
@@ -102,8 +114,8 @@ def verify_datasets():
         for i, d in enumerate(dataset_dicts[:3]):
             print(f"Sample {i}: {d}")
 
-train_proposals_path = "/clusterlivenfs/gnmp/RRPN/data/nucoco/proposals/proposals_train.pkl"
-val_proposals_path = "/clusterlivenfs/gnmp/RRPN/data/nucoco/proposals/proposals_val.pkl"
+train_proposals_path = ("/clusterlivenfs/gnmp/RRPN/data/nucoco/proposals/proposals_train.pkl", )
+val_proposals_path = ("/clusterlivenfs/gnmp/RRPN/data/nucoco/proposals/proposals_val.pkl", )
 
 def verify_proposals(proposals_path):
     check_open_fds()
@@ -143,7 +155,8 @@ class CustomTrainer(DefaultTrainer):
     @classmethod
     def build_train_loader(cls, cfg):
         proposal_files_train = cfg.DATASETS.PROPOSAL_FILES_TRAIN
-        mapper = RadarDatasetMapper(cfg, is_train=True, proposal_files=proposal_files_train)
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        mapper = RadarDatasetMapper(cfg, is_train=True, proposal_files=proposal_files_train, device=device)
         return build_detection_train_loader(cfg, mapper=mapper, num_workers=1)
 
     @classmethod
@@ -206,13 +219,14 @@ class CustomTrainer(DefaultTrainer):
             original_image_file = os.path.join(image_folder, "original_image.png")
             cv2.imwrite(original_image_file, image)
 
+            # Save ground truth boxes and classes
             gt_boxes = batch["instances"].gt_boxes.tensor.cpu().numpy()
             gt_classes = batch["instances"].gt_classes.cpu().numpy()
 
             for box, cls in zip(gt_boxes, gt_classes):
                 x0, y0, x1, y1 = box.astype(int)
                 class_name = self.metadata.thing_classes[cls]
-                color = (0, 255, 0) 
+                color = (0, 255, 0)  # Green for ground truth
                 cv2.rectangle(image, (x0, y0), (x1, y1), color, 2)
                 cv2.putText(image, class_name, (x0, y0 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.9, color, 2)
 
@@ -229,8 +243,35 @@ class CustomTrainer(DefaultTrainer):
             with open(gt_file, 'w') as f:
                 json.dump(gt_data, f, indent=4)
 
-            saved_count += 1
+            if "proposals" in batch:
+                proposals_boxes = batch["proposals"].proposal_boxes.tensor
+                proposals_scores = batch["proposals"].objectness_logits
 
+                if isinstance(proposals_boxes, torch.Tensor):
+                    proposals_boxes = proposals_boxes.cpu().numpy()
+                
+                if isinstance(proposals_scores, torch.Tensor):
+                    proposals_scores = proposals_scores.cpu().numpy()
+
+                for box, score in zip(proposals_boxes, proposals_scores):
+                    x0, y0, x1, y1 = box.astype(int)
+                    color = (255, 0, 0)  # Blue for proposals
+                    cv2.rectangle(image, (x0, y0), (x1, y1), color, 2)
+                    cv2.putText(image, f"{score:.2f}", (x0, y0 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.9, color, 2)
+
+                proposals_image_file = os.path.join(image_folder, "proposals_image.png")
+                cv2.imwrite(proposals_image_file, image)    
+
+                proposals_data = {
+                    "image_id": image_id,
+                    "proposal_boxes": proposals_boxes.tolist(),
+                    "proposal_scores": proposals_scores.tolist(),
+                }
+                proposals_file = os.path.join(image_folder, "proposals_data.json")
+                with open(proposals_file, 'w') as f:
+                    json.dump(proposals_data, f, indent=4)
+
+            saved_count += 1
 
 def setup(args):    
     cfg = get_cfg()
@@ -253,6 +294,7 @@ def main(args):
     trainer.train()
 
 if __name__ == "__main__":
+    mp.set_start_method('spawn', force=True)
     parser = argparse.ArgumentParser(description="Train a Detectron2 model")
     parser.add_argument("--config-file", default="", metavar="FILE", help="path to config file")
     parser.add_argument("--num-gpus", type=int, default=1, help="number of gpus *per machine*")

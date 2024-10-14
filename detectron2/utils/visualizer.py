@@ -241,6 +241,10 @@ def _create_text_labels(classes, scores, class_names, is_crowd=None):
     labels = None
     if classes is not None:
         if class_names is not None and len(class_names) > 0:
+            print("Classes: ", classes)
+            print("class_names: ", class_names)
+            print("len de classes: ", len(classes))
+            print("len de class_names: ", len(class_names))
             labels = [class_names[i] for i in classes]
         else:
             labels = [str(i) for i in classes]
