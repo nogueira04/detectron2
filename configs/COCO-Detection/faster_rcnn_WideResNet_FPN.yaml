@@ -1,0 +1,26 @@
+MODEL:
+  META_ARCHITECTURE: "GeneralizedRCNN"
+  
+  BACKBONE:
+    NAME: "build_wide_resnet_backbone"   
+    FREEZE_AT: 2
+
+  RESNETS:
+    DEPTH: 50
+    OUT_FEATURES: ["res2", "res3", "res4", "res5"]  
+    
+  FPN:
+    IN_FEATURES: ["res2", "res3", "res4", "res5"]   
+    
+  ROI_HEADS:
+    NUM_CLASSES: 80 
+
+DATASETS:
+  TRAIN: ("coco_2017_train",)
+  TEST: ("coco_2017_val",)
+
+SOLVER:
+  MAX_ITER: 270000
+  BASE_LR: 0.02
+  STEPS: (210000, 250000)
+  IMS_PER_BATCH: 16

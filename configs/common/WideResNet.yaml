@@ -1,0 +1,7 @@
+MODEL:
+  BACKBONE:
+    NAME: "build_wideresnet_backbone"
+    OUT_FEATURES: ["res4", "res5"]
+  WIDERESNET:
+    PRETRAINED: True
+
