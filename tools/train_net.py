@@ -9,6 +9,7 @@ from detectron2.data import build_detection_test_loader
 from detectron2.utils.events import get_event_storage
 from detectron2.utils.visualizer import Visualizer
 from detectron2.structures import Boxes, Instances
+import optuna
 import matplotlib.pyplot as plt
 import torch.multiprocessing as mp
 import os
@@ -144,7 +145,7 @@ def data_loader_test(cfg):
 class CustomTrainer(DefaultTrainer):
     def __init__(self, cfg, debug=False, debug_interval=50):
         super().__init__(cfg)
-        self.debug = True
+        self.debug = False
         self.debug_dir = os.path.join(cfg.OUTPUT_DIR, "debug_data")
         self.debug_interval = debug_interval  # Interval for saving debug information
         self.iteration_count = 0  # Track iterations
@@ -285,13 +286,126 @@ def setup(args):
 def main(args):
     cfg = setup(args)
     
-    # Add debug argument
     debug = 'DEBUG' in args.opts
 
-    # Train with Detailed Logging
     trainer = CustomTrainer(cfg, debug=debug)
     trainer.resume_or_load(resume=False)
     trainer.train()
+
+# def objective(trial):
+#     cfg = get_cfg()
+#     add_proposal_cfg(cfg)
+#     cfg.set_new_allowed(True)
+#     cfg.merge_from_file(args.config_file)
+    
+#     cfg.SOLVER.BASE_LR = trial.suggest_loguniform("lr   ", 1e-5, 1e-3)
+#     cfg.SOLVER.WEIGHT_DECAY = trial.suggest_loguniform("weight_decay", 1e-5, 1e-2)
+#     cfg.SOLVER.MOMENTUM = trial.suggest_float("momentum", 0.8, 0.99)
+#     # cfg.SOLVER.IMS_PER_BATCH = trial.suggest_categorical("batch_size", [2, 4, 8])
+#     cfg.MODEL.BACKBONE.FREEZE_AT = trial.suggest_categorical("freeze_at", [0, 2, 4])
+    
+#     cfg.DATASETS.TRAIN = ("nucoco_train",)
+#     cfg.DATASETS.TEST = ("nucoco_val",)
+#     cfg.DATALOADER.NUM_WORKERS = 4
+#     cfg.SOLVER.MAX_ITER = 40000
+#     cfg.OUTPUT_DIR = f"./output_trial_{trial.number}"
+    
+#     trainer = CustomTrainer(cfg)
+#     trainer.resume_or_load(resume=False)
+    
+#     try:
+#         trainer.train()
+#         evaluator = COCOEvaluator("nucoco_val", cfg, False, output_dir=cfg.OUTPUT_DIR)
+#         val_loader = build_detection_test_loader(cfg, "nucoco_val")
+#         eval_results = inference_on_dataset(trainer.model, val_loader, evaluator)
+
+#         print(f"Trial {trial.number}, {eval_results}")
+        
+#         return eval_results["bbox"]["AP"]
+    
+#     except Exception as e:
+#         print(f"Error during training: {e}")
+#         return float("nan")
+
+def objective(trial):
+    cfg = get_cfg()
+    add_proposal_cfg(cfg)
+    cfg.set_new_allowed(True)
+    cfg.merge_from_file(args.config_file)
+    
+    # Learning rate and weight decay
+    cfg.SOLVER.BASE_LR = trial.suggest_loguniform("base_lr", 1e-5, 1e-3)
+    cfg.SOLVER.WEIGHT_DECAY = trial.suggest_loguniform("weight_decay", 1e-6, 1e-2)
+    cfg.SOLVER.WEIGHT_DECAY_NORM = trial.suggest_loguniform("weight_decay_norm", 1e-6, 1e-3)
+    
+    # Momentum (only used if SGD is chosen, but we can still tune it)
+    cfg.SOLVER.MOMENTUM = trial.suggest_float("momentum", 0.8, 0.99)
+    
+    # Steps, Max Iter, Scheduler Steps
+    # For steps, we can choose a few tuples as candidates. Make sure it aligns with MAX_ITER.
+    # cfg.SOLVER.STEPS = trial.suggest_categorical("steps", [(5000, 20000), (10000, 15000), (20000, 30000)])
+    cfg.SOLVER.SCHEDULER_STEPS = cfg.SOLVER.STEPS  # To keep them aligned, or you could suggest separately.
+    
+    # Learning rate scheduler and warmup parameters
+    cfg.SOLVER.LR_SCHEDULER_NAME = trial.suggest_categorical("lr_scheduler_name", ["WarmupMultiStepLR", "WarmupCosineLR"])
+    cfg.SOLVER.WARMUP_FACTOR = trial.suggest_float("warmup_factor", 1e-4, 1e-1, log=True)
+    cfg.SOLVER.WARMUP_ITERS = trial.suggest_int("warmup_iters", 100, 2000, step=100)
+    cfg.SOLVER.WARMUP_METHOD = trial.suggest_categorical("warmup_method", ["linear", "constant"])
+    
+    # Gradient clipping
+    clip_grad_enabled = trial.suggest_categorical("clip_grad_enabled", [True, False])
+    cfg.SOLVER.CLIP_GRADIENTS.ENABLED = clip_grad_enabled
+    if clip_grad_enabled:
+        cfg.SOLVER.CLIP_GRADIENTS.CLIP_VALUE = trial.suggest_float("clip_value", 0.1, 10.0, log=True)
+    else:
+        cfg.SOLVER.CLIP_GRADIENTS.CLIP_VALUE = 1.0
+    
+    # Optimizer selection
+    cfg.SOLVER.OPTIMIZER = trial.suggest_categorical("optimizer", ["SGD", "AdamW"])
+    
+    # Gamma (used for step-based LR decay if applicable)
+    cfg.SOLVER.GAMMA = trial.suggest_float("gamma", 0.05, 0.5)
+    
+    # Freeze at layers (existing from your original code)
+    cfg.MODEL.BACKBONE.FREEZE_AT = trial.suggest_categorical("freeze_at", [0, 2, 4])
+    
+    # Dataset configuration (fixed)
+    cfg.DATASETS.TRAIN = ("nucoco_train",)
+    cfg.DATASETS.TEST = ("nucoco_val",)
+    cfg.DATALOADER.NUM_WORKERS = 4
+    
+    # Output directory
+    cfg.OUTPUT_DIR = f"./output_trial_{trial.number}"
+    
+    # Train the model
+    trainer = CustomTrainer(cfg)
+    trainer.resume_or_load(resume=False)
+    
+    try:
+        trainer.train()
+        evaluator = COCOEvaluator("nucoco_val", cfg, False, output_dir=cfg.OUTPUT_DIR)
+        val_loader = build_detection_test_loader(cfg, "nucoco_val")
+        eval_results = inference_on_dataset(trainer.model, val_loader, evaluator)
+
+        print(f"Trial {trial.number}, {eval_results}")
+        
+        # Return the primary metric (assuming bbox AP is what we want)
+        return eval_results["bbox"]["AP"]
+    
+    except Exception as e:
+        print(f"Error during training: {e}")
+        return float("nan")
+
+
+def main_with_optuna(args):
+    storage = "sqlite:///optuna_study.db"
+    
+    study = optuna.create_study(direction="maximize", study_name="detectron_hpo", storage=storage, load_if_exists=True)
+    
+    study.optimize(objective, n_trials=15)
+    
+    print("Best Trial:")
+    print(study.best_trial)
 
 if __name__ == "__main__":
     mp.set_start_method('spawn', force=True)
@@ -301,4 +415,5 @@ if __name__ == "__main__":
     parser.add_argument("opts", help="Modify config options using the command-line", default=None, nargs=argparse.REMAINDER)
     args = parser.parse_args()
     print("Command Line Args:", args)
-    main(args)
+    # main(args)
+    main_with_optuna(args)
