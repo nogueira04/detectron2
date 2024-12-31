@@ -23,25 +23,30 @@ import numpy as np
 import resource
 import json
 import cv2
+import yaml
+import logging
+import optuna
 
 torch.multiprocessing.set_sharing_strategy('file_system')
 
-# Monitor File Descriptors
-def check_open_fds():
-    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
-    print(f"Soft limit: {soft}, Hard limit: {hard}")
-    print(f"Number of open file descriptors: {len(os.listdir('/proc/self/fd'))}")
+root_dir = os.path.dirname(os.path.abspath(__file__))
+dataset_config_path = os.path.join(root_dir, "configs/general_config.yaml")
+dataset_config = None
+with open(dataset_config_path, "r") as f:
+    dataset_config = yaml.safe_load(f)
 
-check_open_fds()
+val_config = dataset_config["NUCOCO"]["VAL"]
+train_config = dataset_config["NUCOCO"]["TRAIN"]
 
+# Dataset registration
 _DATASETS = {
     'nucoco_val': {
-        'img_dir': '/clusterlivenfs/gnmp/RRPN/data/nucoco/val',
-        'ann_file': '/clusterlivenfs/gnmp/RRPN/data/nucoco/annotations/instances_val.json',
+            'img_dir': val_config["IMG_DIR"],
+            'ann_file': val_config["ANNOT_DIR"],
     },
     'nucoco_train': {
-        'img_dir': '/clusterlivenfs/gnmp/RRPN/data/nucoco/train',
-        'ann_file': '/clusterlivenfs/gnmp/RRPN/data/nucoco/annotations/instances_train.json',
+        'img_dir': train_config["IMG_DIR"],
+        'ann_file': train_config["ANNOT_DIR"],
     },
 }
 
@@ -54,8 +59,8 @@ def register_datasets():
         # Set the metadata for the dataset (e.g., class names)
         MetadataCatalog.get(dataset_name).set(thing_classes=list(category_id_to_name.values()))
 
-DatasetCatalog.clear()  # Clear any existing dataset registration
-MetadataCatalog.clear()  # Clear existing metadata
+DatasetCatalog.clear()  
+MetadataCatalog.clear() 
 register_datasets()
 
 def add_proposal_cfg(cfg):
@@ -66,7 +71,7 @@ class RadarDatasetMapper(DatasetMapper):
     def __init__(self, cfg, is_train=True, proposal_files=None, device=None):
         super().__init__(cfg, is_train)
         self.proposal_files = proposal_files
-        self.device = device  # Store the device
+        self.device = device 
         with open(self.proposal_files[0], 'rb') as f:
             self.proposals = pickle.load(f)
         
@@ -81,7 +86,6 @@ class RadarDatasetMapper(DatasetMapper):
             proposals = self.proposals['boxes'][idx]  # This should be a numpy array of shape [N, 4]
             scores = self.proposals['scores'][idx]     # This should be a corresponding numpy array of shape [N]
 
-            # Check for NaN or Inf
             if np.isnan(proposals).any() or np.isinf(proposals).any():
                 print(f"Proposals for image_id {image_id} contain NaN or Inf values")
                 print(f"Proposals: {proposals}")
@@ -100,54 +104,16 @@ class RadarDatasetMapper(DatasetMapper):
 
         return dataset_dict
 
-
-
-# Verify Datasets
-def verify_datasets():
-    for dataset_name in _DATASETS.keys():
-        dataset_dicts = DatasetCatalog.get(dataset_name)
-        metadata = MetadataCatalog.get(dataset_name)
-        print(f"Dataset: {dataset_name}, Number of samples: {len(dataset_dicts)}")
-        print(f"Metadata: {metadata}")
-
-        # Inspect some annotations
-        for i, d in enumerate(dataset_dicts[:3]):
-            print(f"Sample {i}: {d}")
-
 train_proposals_path = ("/clusterlivenfs/gnmp/RRPN/data/nucoco/proposals/proposals_train.pkl", )
 val_proposals_path = ("/clusterlivenfs/gnmp/RRPN/data/nucoco/proposals/proposals_val.pkl", )
-
-def verify_proposals(proposals_path):
-    check_open_fds()
-    with open(proposals_path, 'rb') as f:
-        proposals = pickle.load(f)
-        print(f"Proposals Keys: {proposals.keys()}")
-        print(f"Number of Proposals: {len(proposals['ids'])}")
-        print(f"Example Proposal: {proposals['boxes'][0]}")
-    check_open_fds()
-
-# Validate Data Loader
-def data_loader_test(cfg):
-    print("Testing Train Data Loader")
-    train_loader = build_detection_train_loader(cfg)
-    for batch in train_loader:
-        print(f"Train Data Batch: {batch}")
-        break
-
-    print("Testing Test Data Loader")
-    test_loader = build_detection_test_loader(cfg, cfg.DATASETS.TEST[0])
-    for batch in test_loader:
-        print(f"Test Data Batch: {batch}")
-        break
-
 
 class CustomTrainer(DefaultTrainer):
     def __init__(self, cfg, debug=False, debug_interval=50):
         super().__init__(cfg)
-        self.debug = True
+        self.debug = debug
         self.debug_dir = os.path.join(cfg.OUTPUT_DIR, "debug_data")
-        self.debug_interval = debug_interval  # Interval for saving debug information
-        self.iteration_count = 0  # Track iterations
+        self.debug_interval = debug_interval  
+        self.iteration_count = 0  
         if self.debug:
             os.makedirs(self.debug_dir, exist_ok=True)
             self.metadata = MetadataCatalog.get(cfg.DATASETS.TRAIN[0])
@@ -174,7 +140,13 @@ class CustomTrainer(DefaultTrainer):
 
         # Save debug information at specific intervals
         if self.debug and (self.iteration_count % self.debug_interval == 0):
-            self._save_debug_info(data)
+            try:
+                self._save_debug_info(data)
+            except OSError as e:
+                if "No space left on device" in str(e):
+                    logging.warning("[WARNING] Not enough space to save debug files. Skipping this save.")
+                else:
+                    raise
 
         loss_dict = self.model(data)
         losses = sum(loss_dict.values())
@@ -190,7 +162,6 @@ class CustomTrainer(DefaultTrainer):
 
         self._write_metrics(loss_dict, data_time)
 
-        # Increment the iteration counter
         self.iteration_count += 1
 
     def _write_metrics(self, loss_dict, data_time):
@@ -226,7 +197,7 @@ class CustomTrainer(DefaultTrainer):
             for box, cls in zip(gt_boxes, gt_classes):
                 x0, y0, x1, y1 = box.astype(int)
                 class_name = self.metadata.thing_classes[cls]
-                color = (0, 255, 0)  # Green for ground truth
+                color = (0, 255, 0)
                 cv2.rectangle(image, (x0, y0), (x1, y1), color, 2)
                 cv2.putText(image, class_name, (x0, y0 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.9, color, 2)
 
@@ -255,7 +226,7 @@ class CustomTrainer(DefaultTrainer):
 
                 for box, score in zip(proposals_boxes, proposals_scores):
                     x0, y0, x1, y1 = box.astype(int)
-                    color = (255, 0, 0)  # Blue for proposals
+                    color = (255, 0, 0)  
                     cv2.rectangle(image, (x0, y0), (x1, y1), color, 2)
                     cv2.putText(image, f"{score:.2f}", (x0, y0 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.9, color, 2)
 
@@ -282,13 +253,75 @@ def setup(args):
     cfg.freeze()
     return cfg
 
+def objective(trial):
+    cfg = get_cfg()
+    add_proposal_cfg(cfg)
+    cfg.set_new_allowed(True)
+    cfg.merge_from_file(args.config_file)
+    
+    cfg.SOLVER.BASE_LR = trial.suggest_loguniform("base_lr", 1e-5, 1e-3)
+    cfg.SOLVER.WEIGHT_DECAY = trial.suggest_loguniform("weight_decay", 1e-6, 1e-2)
+    cfg.SOLVER.WEIGHT_DECAY_NORM = trial.suggest_loguniform("weight_decay_norm", 1e-6, 1e-3)
+    
+    cfg.SOLVER.MOMENTUM = trial.suggest_float("momentum", 0.8, 0.99)
+
+    cfg.SOLVER.SCHEDULER_STEPS = cfg.SOLVER.STEPS  
+    
+    cfg.SOLVER.LR_SCHEDULER_NAME = trial.suggest_categorical("lr_scheduler_name", ["WarmupMultiStepLR", "WarmupCosineLR"])
+    cfg.SOLVER.WARMUP_FACTOR = trial.suggest_float("warmup_factor", 1e-4, 1e-1, log=True)
+    cfg.SOLVER.WARMUP_ITERS = trial.suggest_int("warmup_iters", 100, 2000, step=100)
+    cfg.SOLVER.WARMUP_METHOD = trial.suggest_categorical("warmup_method", ["linear", "constant"])
+    
+    clip_grad_enabled = trial.suggest_categorical("clip_grad_enabled", [True, False])
+    cfg.SOLVER.CLIP_GRADIENTS.ENABLED = clip_grad_enabled
+    if clip_grad_enabled:
+        cfg.SOLVER.CLIP_GRADIENTS.CLIP_VALUE = trial.suggest_float("clip_value", 0.1, 10.0, log=True)
+    else:
+        cfg.SOLVER.CLIP_GRADIENTS.CLIP_VALUE = 1.0
+    
+    cfg.SOLVER.OPTIMIZER = trial.suggest_categorical("optimizer", ["SGD", "AdamW"])
+    
+    cfg.SOLVER.GAMMA = trial.suggest_float("gamma", 0.05, 0.5)
+    
+    cfg.MODEL.BACKBONE.FREEZE_AT = trial.suggest_categorical("freeze_at", [0, 2, 4])
+    
+    cfg.DATASETS.TRAIN = ("nucoco_train",)
+    cfg.DATASETS.TEST = ("nucoco_val",)
+    cfg.DATALOADER.NUM_WORKERS = 4
+    
+    cfg.OUTPUT_DIR = f"./output_trial_{trial.number}"
+    
+    trainer = CustomTrainer(cfg)
+    trainer.resume_or_load(resume=False)
+    
+    try:
+        trainer.train()
+        evaluator = COCOEvaluator("nucoco_val", cfg, False, output_dir=cfg.OUTPUT_DIR)
+        val_loader = build_detection_test_loader(cfg, "nucoco_val")
+        eval_results = inference_on_dataset(trainer.model, val_loader, evaluator)
+        print(f"Trial {trial.number}, {eval_results}")
+        
+        return eval_results["bbox"]["AP"]
+    
+    except Exception as e:
+        print(f"Error during training: {e}")
+        return float("nan")
+    
+def main_with_optuna(args):
+    storage = "sqlite:///optuna_study.db"
+    
+    study = optuna.create_study(direction="maximize", study_name="detectron_hpo", storage=storage, load_if_exists=True)
+    
+    study.optimize(objective, n_trials=15)
+    
+    print("Best Trial:")
+    print(study.best_trial)
+
 def main(args):
     cfg = setup(args)
     
-    # Add debug argument
-    debug = 'DEBUG' in args.opts
+    debug = args.debug
 
-    # Train with Detailed Logging
     trainer = CustomTrainer(cfg, debug=debug)
     trainer.resume_or_load(resume=False)
     trainer.train()
@@ -298,7 +331,12 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train a Detectron2 model")
     parser.add_argument("--config-file", default="", metavar="FILE", help="path to config file")
     parser.add_argument("--num-gpus", type=int, default=1, help="number of gpus *per machine*")
+    parser.add_argument("--debug", action="store_true", help="Enable debug mode")
+    parser.add_argument("--optuna", action="store_true", help="Enable Optuna hyperparameter optimization")
     parser.add_argument("opts", help="Modify config options using the command-line", default=None, nargs=argparse.REMAINDER)
     args = parser.parse_args()
     print("Command Line Args:", args)
-    main(args)
+    if args.optuna:
+        main_with_optuna(args)
+    else:
+        main(args)

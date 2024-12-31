@@ -12,15 +12,25 @@ MODEL:
   FPN:
     IN_FEATURES: ["res2", "res3", "res4", "res5"]   
     
-  ROI_HEADS:
-    NUM_CLASSES: 80 
 
 DATASETS:
-  TRAIN: ("coco_2017_train",)
-  TEST: ("coco_2017_val",)
+  TRAIN: ("nucoco_train",)
+  TEST: ("nucoco_val",)
 
 SOLVER:
-  MAX_ITER: 270000
-  BASE_LR: 0.02
-  STEPS: (210000, 250000)
-  IMS_PER_BATCH: 16
+  STEPS: (60000, 80000, 100000, 130000)      # Adjusted learning rate decay steps to smooth transitions
+  MAX_ITER: 150000           # Slightly increased maximum iterations for more gradual training
+  BASE_LR: 0.0008825170673330199           # Lowered base learning rate for more stable gradient updates
+  WEIGHT_DECAY: 7.47537612951795e-05       # Increased weight decay to prevent overfitting and reduce variability
+  LR_SCHEDULER_NAME: "WarmupCosineLR"  # Smoother learning rate schedule with cosine annealing
+  WARMUP_FACTOR: 0.001       # Factor for gradual warmup
+  WARMUP_ITERS: 1000         # Number of warmup iterations
+  WARMUP_METHOD: "linear"    # Linear warmup for smoother transition to base learning rate
+  CLIP_VALUE: 1.0          # Gradient clipping to stabilize gradient updates
+  IMS_PER_BATCH: 4          # Adjust batch size if needed (depends on your GPU memory)
+  OPTIMIZER: "AdamW"         # AdamW optimizer for more stable learning
+  MOMENTUM: 0.9882741500174196              # Only used if switching back to SGD
+  WEIGHT_DECAY_NORM: 0.0001  # Optional additional regularization for norm layers
+  GAMMA: 0.1                 # Factor for reducing the learning rate at STEPS
+  SCHEDULER_STEPS: (60000, 80000, 100000, 130000)  # Ensure scheduler aligns with learning rate steps
+  EVAL_PERIOD: 10000  # Run validation every 5000 iterations
