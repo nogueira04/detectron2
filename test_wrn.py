@@ -1,6 +1,7 @@
 import torch
 from detectron2.config import get_cfg
 from detectron2.modeling import build_model
+import detectron2.modeling.backbone.wide_resnet
 
 def quick_test_wide_resnet():
     cfg = get_cfg()

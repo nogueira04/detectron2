@@ -1,0 +1,105 @@
+# --------------------------------------------------------
+# Example Detectron2 config for training EfficientNet-B0 + FPN
+# with a Faster R-CNN (GeneralizedRCNN) meta-architecture.
+# --------------------------------------------------------
+
+MODEL:
+  # Use a standard RCNN meta-architecture (Faster/Mask RCNN style).
+  META_ARCHITECTURE: "GeneralizedRCNN"
+
+  # Name of your custom FPN backbone that you’ve registered.
+  BACKBONE:
+    NAME: "build_efficientnet_fpn_backbone"
+    EFFICIENTNET_TYPE: "efficientnet_b0"
+
+  # FPN-related settings
+  FPN:
+    IN_FEATURES: ["res2", "res3", "res4", "res5"]  # from the EfficientNet backbone
+    OUT_CHANNELS: 256
+    FUSE_TYPE: "sum"
+
+  # RPN settings
+  RPN:
+    IN_FEATURES: ["p2", "p3", "p4", "p5"]  # FPN pyramid layers
+    HEAD_NAME: "StandardRPNHead"
+    BATCH_SIZE_PER_IMAGE: 256   # Per-image RoI proposals
+    POSITIVE_FRACTION: 0.5
+    # ANCHOR_GENERATOR can be configured here if needed:
+    # ANCHOR_GENERATOR:
+    #   SIZES: [[32], [64], [128], [256], [512]]
+    #   ASPECT_RATIOS: [[0.5, 1.0, 2.0]]
+
+  # ROI Heads settings
+  ROI_HEADS:
+    NAME: "StandardROIHeads"
+    IN_FEATURES: ["p2", "p3", "p4", "p5"]  # FPN pyramid layers
+    NUM_CLASSES: 7   # or your dataset's number of classes
+    BATCH_SIZE_PER_IMAGE: 512
+    POSITIVE_FRACTION: 0.25
+
+  # ROI Box head
+  ROI_BOX_HEAD:
+    NAME: "FastRCNNConvFCHead"
+    NUM_FC: 2
+    FC_DIM: 1024
+    NUM_CONV: 0
+    CONV_DIM: 256
+    POOLER_RESOLUTION: 7
+    POOLER_SAMPLING_RATIO: 0
+    POOLER_TYPE: "ROIAlignV2"
+
+  # Optionally, if you wanted a Mask R-CNN, you’d define ROI_MASK_HEAD similarly:
+  # ROI_MASK_HEAD:
+  #   NAME: "MaskRCNNConvUpsampleHead"
+  #   NUM_CONV: 4
+  #   CONV_DIM: 256
+  #   POOLER_RESOLUTION: 14
+  #   POOLER_SAMPLING_RATIO: 0
+  #   POOLER_TYPE: "ROIAlignV2"
+
+  # Pretrained weights file. 
+  # If you want to start from scratch, you can leave it blank or comment it out.
+  WEIGHTS: ""
+
+SOLVER:
+  STEPS: (60000, 80000, 100000, 130000)      # Adjusted learning rate decay steps to smooth transitions
+  MAX_ITER: 150000           # Slightly increased maximum iterations for more gradual training
+  BASE_LR: 0.0008825170673330199           # Lowered base learning rate for more stable gradient updates
+  WEIGHT_DECAY: 7.47537612951795e-05       # Increased weight decay to prevent overfitting and reduce variability
+  LR_SCHEDULER_NAME: "WarmupCosineLR"  # Smoother learning rate schedule with cosine annealing
+  WARMUP_FACTOR: 0.001       # Factor for gradual warmup
+  WARMUP_ITERS: 1000         # Number of warmup iterations
+  WARMUP_METHOD: "linear"    # Linear warmup for smoother transition to base learning rate
+  CLIP_VALUE: 1.0          # Gradient clipping to stabilize gradient updates
+  IMS_PER_BATCH: 4          # Adjust batch size if needed (depends on your GPU memory)
+  OPTIMIZER: "AdamW"         # AdamW optimizer for more stable learning
+  MOMENTUM: 0.9882741500174196              # Only used if switching back to SGD
+  WEIGHT_DECAY_NORM: 0.0001  # Optional additional regularization for norm layers
+  GAMMA: 0.1                 # Factor for reducing the learning rate at STEPS
+  SCHEDULER_STEPS: (60000, 80000, 100000, 130000)  # Ensure scheduler aligns with learning rate steps
+
+DATASETS:
+  # Register your dataset names in DatasetCatalog & MetadataCatalog before training
+  TRAIN: ("nucoco_train",)
+  TEST: ("nucoco_val",)
+
+TEST:
+  # Evaluate every X iterations (during training)
+  EVAL_PERIOD: 10000
+
+# INPUT:
+#   # Training image sizes; detectron2 can resize them each epoch (“choice”)
+#   MIN_SIZE_TRAIN: (640, 672, 704, 736, 768, 800)
+#   MAX_SIZE_TRAIN: 1333
+#   MIN_SIZE_TRAIN_SAMPLING: "choice"
+
+#   MIN_SIZE_TEST: 800
+#   MAX_SIZE_TEST: 1333
+
+#   # Whether to apply random horizontal flips, etc.
+#   # (These can also be set to True if you want augmentation.)
+#   CROP:
+#     ENABLED: False
+#   FORMAT: "BGR"
+
+# OUTPUT_DIR: "./output/efficientnet_b0_fpn"

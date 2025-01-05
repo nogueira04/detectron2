@@ -33,4 +33,6 @@ SOLVER:
   WEIGHT_DECAY_NORM: 0.0001  # Optional additional regularization for norm layers
   GAMMA: 0.1                 # Factor for reducing the learning rate at STEPS
   SCHEDULER_STEPS: (60000, 80000, 100000, 130000)  # Ensure scheduler aligns with learning rate steps
-  EVAL_PERIOD: 10000  # Run validation every 5000 iterations
+
+TEST:
+  EVAL_PERIOD: 10000          
