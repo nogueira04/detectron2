@@ -1,0 +1,73 @@
+# file: vit_b16_no_fpn.yaml
+# -----------------------------------------------------------
+# Example config for a Faster R-CNN using Vision Transformer Backbone without FPN
+# -----------------------------------------------------------
+
+MODEL:
+  META_ARCHITECTURE: "GeneralizedRCNN"  # Ensure this is set to GeneralizedRCNN
+
+  BACKBONE:
+    NAME: "build_vit_b16_backbone"  # Use the custom backbone without FPN
+
+  # Remove or omit the FPN section entirely since we're not using FPN
+  # If present, ensure it's not being utilized or remove it to prevent conflicts
+
+  # RPN settings
+  RPN:
+    IN_FEATURES: ["res5"]  # Use the backbone's feature map directly
+    HEAD_NAME: "StandardRPNHead"
+    BATCH_SIZE_PER_IMAGE: 256
+    POSITIVE_FRACTION: 0.5
+
+  # ROI Heads settings
+  ROI_HEADS:
+    NAME: "StandardROIHeads"
+    IN_FEATURES: ["res5"]  # Use the backbone's feature map directly
+    NUM_CLASSES: 7
+    BATCH_SIZE_PER_IMAGE: 512
+    POSITIVE_FRACTION: 0.25
+
+  # ROI Box Head
+  ROI_BOX_HEAD:
+    NAME: "FastRCNNConvFCHead"
+    NUM_FC: 2
+    FC_DIM: 1024
+    NUM_CONV: 0
+    CONV_DIM: 256
+    POOLER_RESOLUTION: 7
+    POOLER_SAMPLING_RATIO: 0
+    POOLER_TYPE: "ROIAlignV2"
+
+  # If you want to initialize from a .pth, specify it here:
+  WEIGHTS: ""
+
+SOLVER:
+  STEPS: (60000, 80000, 100000, 130000, 200000, 300000, 350000)
+  MAX_ITER: 400000
+  BASE_LR: 0.0008825170673330199
+  WEIGHT_DECAY: 7.47537612951795e-05
+  LR_SCHEDULER_NAME: "WarmupCosineLR"
+  WARMUP_FACTOR: 0.001
+  WARMUP_ITERS: 1000
+  WARMUP_METHOD: "linear"
+  # CLIP_VALUE: 1.0
+  IMS_PER_BATCH: 1
+  # OPTIMIZER: "AdamW"
+  MOMENTUM: 0.9882741500174196
+  WEIGHT_DECAY_NORM: 0.0001
+  GAMMA: 0.1
+  # SCHEDULER_STEPS: (60000, 80000, 100000, 130000, 200000, 300000, 350000)
+
+DATASETS:
+  TRAIN: ("nucoco_train",)
+  TEST: ("nucoco_val",)
+
+TEST:
+  EVAL_PERIOD: 10000
+
+# Add or modify the INPUT section as follows:
+INPUT:
+  MIN_SIZE_TRAIN: (224,)      # Use a tuple with one element
+  MAX_SIZE_TRAIN: 224         # Single integer is acceptable for MAX_SIZE
+  MIN_SIZE_TEST: 224
+  MAX_SIZE_TEST: 224
