@@ -9,6 +9,9 @@ from detectron2.data import build_detection_test_loader
 from detectron2.utils.events import get_event_storage
 from detectron2.utils.visualizer import Visualizer
 from detectron2.structures import Boxes, Instances
+import detectron2.modeling.backbone.wide_resnet
+import detectron2.modeling.backbone.efficientnet_fpn
+import detectron2.modeling.backbone.efficientnet_b7_fpn
 import matplotlib.pyplot as plt
 import torch.multiprocessing as mp
 import os
@@ -29,7 +32,16 @@ import optuna
 
 torch.multiprocessing.set_sharing_strategy('file_system')
 
-root_dir = os.path.dirname(os.path.abspath(__file__))
+current_path = os.path.dirname(os.path.abspath(__file__))
+
+while os.path.basename(current_path) != 'RRPN':
+    parent = os.path.dirname(current_path)
+    if parent == current_path:
+        raise RuntimeError("Couldn't find 'RRPN' in path hierarchy.")
+    current_path = parent
+
+root_dir = current_path
+
 dataset_config_path = os.path.join(root_dir, "configs/general_config.yaml")
 dataset_config = None
 with open(dataset_config_path, "r") as f:
